@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Prediction Result</title>
+</head>
+<body>
+  <h2>Prediction: {{ label }} ({{ confidence }} %)</h2>
+
+  {% if heatmap %}
+    <h3>Infected Area (AI Overlay):</h3>
+    <img src="data:image/png;base64,{{ heatmap }}" width="400">
+  {% else %}
+    <p>No infection heatmap (either Normal or API error).</p>
+  {% endif %}
+
+  <br><a href="/">Upload another scan</a>
+</body>
+</html>
