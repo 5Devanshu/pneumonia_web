@@ -2,17 +2,20 @@
 <html>
 <head>
   <title>Prediction Result</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-  <h2>Prediction: {{ label }} ({{ confidence }} %)</h2>
+  <div class="result-container">
+    <h2>Prediction: {{ label }} ({{ confidence }} %)</h2>
 
-  {% if heatmap %}
-    <h3>Infected Area (AI Overlay):</h3>
-    <img src="data:image/png;base64,{{ heatmap }}" width="400">
-  {% else %}
-    <p>No infection heatmap (either Normal or API error).</p>
-  {% endif %}
+    {% if heatmap %}
+      <h3>Segmented Areas (AI Overlay):</h3>
+      <img src="data:image/png;base64,{{ heatmap }}" alt="Segmented Image">
+    {% else %}
+      <p>No segmentation heatmap generated.</p>
+    {% endif %}
 
-  <br><a href="/">Upload another scan</a>
+    <a href="/">Upload another scan</a>
+  </div>
 </body>
 </html>

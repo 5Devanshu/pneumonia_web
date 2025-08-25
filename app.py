@@ -2,53 +2,106 @@ import os
 import base64
 import requests
 from flask import Flask, request, render_template
-import tensorflow as tf
-from tensorflow.keras.preprocessing import image
 import numpy as np
+from PIL import Image
+import torch
+import cv2
+import io
+from transformers import AutoImageProcessor, AutoModelForImageClassification, AutoModel
 
-# ==== Load your model ====
-MODEL_PATH = "densenet_model.keras"
-model = tf.keras.models.load_model(MODEL_PATH)
+# ==== Load Hugging Face models ====
+# Model for Pneumonia Classification
+HF_CLASSIFICATION_MODEL_NAME = "dima806/chest_xray_pneumonia_detection"
+processor_clf = AutoImageProcessor.from_pretrained(HF_CLASSIFICATION_MODEL_NAME)
+model_clf = AutoModelForImageClassification.from_pretrained(HF_CLASSIFICATION_MODEL_NAME)
+
+# Model for Segmentation and View Classification
+HF_SEGMENTATION_MODEL_NAME = "ianpan/chest-x-ray-basic"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_seg = AutoModel.from_pretrained(HF_SEGMENTATION_MODEL_NAME, trust_remote_code=True)
+model_seg = model_seg.eval().to(device)
 
 # ==== Flask setup ====
 app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ==== Preprocess ====
-def prepare_image(img_path, target_size=(224, 224)):
-    img = image.load_img(img_path, target_size=target_size)
-    x = image.img_to_array(img)
-    x = np.expand_dims(x, axis=0) / 255.0
-    return x
+# ==== Preprocess for Classification Model ====
+def prepare_image_clf(img_path):
+    image = Image.open(img_path).convert("RGB")
+    inputs = processor_clf(images=image, return_tensors="pt")
+    return inputs
 
-# ==== Prediction ====
-def predict_local(img_path):
-    img_array = prepare_image(img_path)
-    preds = model.predict(img_array)[0]
-    classes = ["Normal", "Pneumonia"]
-    return classes[np.argmax(preds)], float(np.max(preds))
+# ==== Prediction using Classification Model ====
+def predict_classification_hf(img_path):
+    inputs = prepare_image_clf(img_path)
+    with torch.no_grad():
+        outputs = model_clf(**inputs)
+    logits = outputs.logits
+    predicted_label_idx = logits.argmax(-1).item()
+    
+    id2label = model_clf.config.id2label
+    predicted_label = id2label[predicted_label_idx]
+    
+    probabilities = torch.softmax(logits, dim=-1)[0]
+    confidence = probabilities[predicted_label_idx].item()
+    
+    return predicted_label, confidence
 
-# ==== OpenAI API for infected overlay ====
-def get_openai_overlay(img_path):
-    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-    url = "https://api.openai.com/v1/images/edits"
+# ==== Prediction and Segmentation using Segmentation Model ====
+def predict_segmentation_hf(img_path):
+    img = cv2.imread(img_path, 0) # Load image in grayscale
+    x = model_seg.preprocess(img) # Preprocess for the model
+    x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0) # Add channel, batch dims
+    x = x.float()
 
-    with open(img_path, "rb") as f:
-        files = {"image": f}
-        data = {
-            "model": "gpt-image-1",
-            "prompt": "Highlight the infected pneumonia regions in this lung CT scan using a heatmap-style overlay."
-        }
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    with torch.inference_mode():
+        out = model_seg(x.to(device))
 
-        response = requests.post(url, headers=headers, files=files, data=data)
-        if response.status_code == 200:
-            b64_img = response.json()["data"][0]["b64_json"]
-            return b64_img
-        else:
-            print("OpenAI API error:", response.text)
-            return None
+    # View Classification
+    view_labels = ["AP", "PA", "lateral"]
+    predicted_view_idx = out["view"].argmax(-1).item()
+    predicted_view = view_labels[predicted_view_idx]
+    
+    # Segmentation mask
+    mask = out["mask"].argmax(1).squeeze(0).cpu().numpy() # 1=right lung, 2=left lung, 3=heart
+
+    return predicted_view, mask
+
+# ==== Generate Heatmap from Segmentation Mask ====
+def generate_heatmap_from_mask(original_img_path, mask):
+    original_img = cv2.imread(original_img_path)
+    original_img_rgb = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+    
+    # Resize the mask to the original image's dimensions
+    mask_resized = cv2.resize(mask.astype(np.uint8), 
+                              (original_img_rgb.shape[1], original_img_rgb.shape[0]), 
+                              interpolation=cv2.INTER_NEAREST)
+
+    # Create a blank image for the heatmap
+    heatmap = np.zeros_like(original_img_rgb, dtype=np.uint8)
+
+    # Define colors for different segments (e.g., red for lungs, blue for heart)
+    # You can adjust these colors as needed
+    lung_color = [255, 0, 0] # Red for lungs
+    heart_color = [0, 0, 255] # Blue for heart
+
+    # Apply colors to the heatmap based on the resized mask
+    # Right lung (1) and Left lung (2)
+    heatmap[mask_resized == 1] = lung_color
+    heatmap[mask_resized == 2] = lung_color
+    # Heart (3)
+    heatmap[mask_resized == 3] = heart_color
+
+    # Blend the heatmap with the original image
+    alpha = 0.4 # Transparency factor
+    blended_img = cv2.addWeighted(original_img_rgb, 1 - alpha, heatmap, alpha, 0)
+
+    # Convert to PIL Image and then to base64
+    pil_img = Image.fromarray(blended_img)
+    buffered = io.BytesIO()
+    pil_img.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 # ==== Routes ====
 @app.route("/", methods=["GET", "POST"])
@@ -59,15 +112,22 @@ def index():
             img_path = os.path.join(UPLOAD_FOLDER, file.filename)
             file.save(img_path)
 
-            label, conf = predict_local(img_path)
-            heatmap_b64 = None
+            # Use the classification model for pneumonia prediction
+            pneumonia_label, pneumonia_conf = predict_classification_hf(img_path)
+            
+            # Use the segmentation model for view prediction and heatmap generation
+            predicted_view, segmentation_mask = predict_segmentation_hf(img_path)
+            
+            # Generate heatmap from the segmentation mask
+            heatmap_b64 = generate_heatmap_from_mask(img_path, segmentation_mask)
 
-            if label == "Pneumonia":
-                heatmap_b64 = get_openai_overlay(img_path)
+            # Combine labels for display
+            label = f"Pneumonia: {pneumonia_label} (View: {predicted_view})"
+            confidence = pneumonia_conf * 100 # Convert to percentage
 
             return render_template("result.html",
                                    label=label,
-                                   confidence=round(conf * 100, 2),
+                                   confidence=round(confidence, 2),
                                    heatmap=heatmap_b64)
     return render_template("index.html")
 
