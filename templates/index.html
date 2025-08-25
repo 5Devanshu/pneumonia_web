@@ -1,14 +1,30 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-  <title>Pneumonia Detection</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta charset="utf-8" />
+  <title>CT PNG Classifier</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:2rem;color:#111}
+    .card{max-width:520px;margin:auto;padding:1.5rem;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 6px 20px rgba(0,0,0,.06)}
+    .hint{color:#6b7280;font-size:.9rem}
+    button{padding:.75rem 1rem;border-radius:12px;border:none;background:#111;color:#fff;cursor:pointer}
+    input[type=file]{padding:.75rem;border:1px solid #e5e7eb;border-radius:12px;width:100%}
+  </style>
 </head>
 <body>
-  <h2>Upload Chest X-ray Image</h2>
-  <form action="/" method="post" enctype="multipart/form-data">
-    <input type="file" name="file" accept="image/*" required>
-    <input type="submit" value="Predict">
-  </form>
+  <div class="card">
+    <h1>CT Scan (PNG) — Cancer Classifier</h1>
+    <p class="hint">Upload a <strong>PNG</strong> CT slice. The app returns prediction, confidence, and an overlay heatmap.</p>
+    <form method="POST" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".png,image/png" required />
+      <div style="height:1rem"></div>
+      <button type="submit">Analyze</button>
+    </form>
+    <p class="hint" style="margin-top:1rem">
+      Model: <code>oohtmeel/swin-tiny-patch4-finetuned-lung-cancer-ct-scans</code>
+    </p>
+    <p class="hint">For research/demo only — not medical advice.</p>
+  </div>
 </body>
 </html>

@@ -1,135 +1,113 @@
 import os
 import base64
-import requests
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, abort
 import numpy as np
 from PIL import Image
 import torch
 import cv2
 import io
-from transformers import AutoImageProcessor, AutoModelForImageClassification, AutoModel
+from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-# ==== Load Hugging Face models ====
-# Model for Pneumonia Classification
-HF_CLASSIFICATION_MODEL_NAME = "dima806/chest_xray_pneumonia_detection"
-processor_clf = AutoImageProcessor.from_pretrained(HF_CLASSIFICATION_MODEL_NAME)
-model_clf = AutoModelForImageClassification.from_pretrained(HF_CLASSIFICATION_MODEL_NAME)
-
-# Model for Segmentation and View Classification
-HF_SEGMENTATION_MODEL_NAME = "ianpan/chest-x-ray-basic"
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_seg = AutoModel.from_pretrained(HF_SEGMENTATION_MODEL_NAME, trust_remote_code=True)
-model_seg = model_seg.eval().to(device)
-
-# ==== Flask setup ====
-app = Flask(__name__)
+# ==== Config ====
+HF_CT_MODEL_NAME = "oohtmeel/swin-tiny-patch4-finetuned-lung-cancer-ct-scans"  # public CT classifier
+ALLOWED_EXT = {".png"}
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ==== Preprocess for Classification Model ====
-def prepare_image_clf(img_path):
-    image = Image.open(img_path).convert("RGB")
-    inputs = processor_clf(images=image, return_tensors="pt")
-    return inputs
+# ==== Load model ====
+device = "cuda" if torch.cuda.is_available() else "cpu"
+processor = AutoImageProcessor.from_pretrained(HF_CT_MODEL_NAME)
+model = AutoModelForImageClassification.from_pretrained(HF_CT_MODEL_NAME).to(device).eval()
 
-# ==== Prediction using Classification Model ====
-def predict_classification_hf(img_path):
-    inputs = prepare_image_clf(img_path)
-    with torch.no_grad():
-        outputs = model_clf(**inputs)
-    logits = outputs.logits
-    predicted_label_idx = logits.argmax(-1).item()
-    
-    id2label = model_clf.config.id2label
-    predicted_label = id2label[predicted_label_idx]
-    
-    probabilities = torch.softmax(logits, dim=-1)[0]
-    confidence = probabilities[predicted_label_idx].item()
-    
-    return predicted_label, confidence
+# ==== Flask ====
+app = Flask(__name__)
 
-# ==== Prediction and Segmentation using Segmentation Model ====
-def predict_segmentation_hf(img_path):
-    img = cv2.imread(img_path, 0) # Load image in grayscale
-    x = model_seg.preprocess(img) # Preprocess for the model
-    x = torch.from_numpy(x).unsqueeze(0).unsqueeze(0) # Add channel, batch dims
-    x = x.float()
+def allowed_file(filename: str) -> bool:
+    return os.path.splitext(filename.lower())[1] in ALLOWED_EXT
 
-    with torch.inference_mode():
-        out = model_seg(x.to(device))
+def pil_to_b64(pil_img):
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    # View Classification
-    view_labels = ["AP", "PA", "lateral"]
-    predicted_view_idx = out["view"].argmax(-1).item()
-    predicted_view = view_labels[predicted_view_idx]
-    
-    # Segmentation mask
-    mask = out["mask"].argmax(1).squeeze(0).cpu().numpy() # 1=right lung, 2=left lung, 3=heart
+def overlay_heatmap_on_image(pil_img, heatmap_2d: np.ndarray, alpha: float = 0.4):
+    # Normalize heatmap 0..1
+    hm = heatmap_2d.astype(np.float32)
+    hm -= hm.min()
+    denom = (hm.max() - hm.min() + 1e-8)
+    hm = hm / denom
 
-    return predicted_view, mask
+    # Resize to original
+    img_np = np.array(pil_img.convert("RGB"))
+    H, W = img_np.shape[:2]
+    hm_resized = cv2.resize(hm, (W, H), interpolation=cv2.INTER_LINEAR)
 
-# ==== Generate Heatmap from Segmentation Mask ====
-def generate_heatmap_from_mask(original_img_path, mask):
-    original_img = cv2.imread(original_img_path)
-    original_img_rgb = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
-    
-    # Resize the mask to the original image's dimensions
-    mask_resized = cv2.resize(mask.astype(np.uint8), 
-                              (original_img_rgb.shape[1], original_img_rgb.shape[0]), 
-                              interpolation=cv2.INTER_NEAREST)
+    # Colorize
+    heatmap_color = cv2.applyColorMap(np.uint8(hm_resized * 255), cv2.COLORMAP_JET)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
 
-    # Create a blank image for the heatmap
-    heatmap = np.zeros_like(original_img_rgb, dtype=np.uint8)
+    # Blend
+    overlay = cv2.addWeighted(img_np, 1 - alpha, heatmap_color, alpha, 0)
+    return Image.fromarray(overlay)
 
-    # Define colors for different segments (e.g., red for lungs, blue for heart)
-    # You can adjust these colors as needed
-    lung_color = [255, 0, 0] # Red for lungs
-    heart_color = [0, 0, 255] # Blue for heart
+def predict_and_saliency(png_path: str):
+    # Load image
+    pil_img = Image.open(png_path).convert("RGB")
 
-    # Apply colors to the heatmap based on the resized mask
-    # Right lung (1) and Left lung (2)
-    heatmap[mask_resized == 1] = lung_color
-    heatmap[mask_resized == 2] = lung_color
-    # Heart (3)
-    heatmap[mask_resized == 3] = heart_color
+    # Preprocess
+    inputs = processor(images=pil_img, return_tensors="pt").to(device)
+    # Enable gradients on input tensor for saliency
+    inputs["pixel_values"].requires_grad_(True)
 
-    # Blend the heatmap with the original image
-    alpha = 0.4 # Transparency factor
-    blended_img = cv2.addWeighted(original_img_rgb, 1 - alpha, heatmap, alpha, 0)
+    # Forward
+    outputs = model(**inputs)
+    logits = outputs.logits  # [1, num_classes]
+    probs = torch.softmax(logits, dim=-1)[0]
+    pred_idx = int(torch.argmax(probs).item())
 
-    # Convert to PIL Image and then to base64
-    pil_img = Image.fromarray(blended_img)
-    buffered = io.BytesIO()
-    pil_img.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+    # Backprop on predicted logit to get dLogit/dInput
+    model.zero_grad(set_to_none=True)
+    logits[0, pred_idx].backward()
 
-# ==== Routes ====
+    # Gradient wrt input pixels
+    grads = inputs["pixel_values"].grad.detach().cpu().numpy()[0]  # [C, H, W]
+    # Use channel-wise L2 (or abs-mean) to get 2D saliency
+    saliency = np.mean(np.abs(grads), axis=0)  # [H, W]
+
+    # Map label
+    id2label = model.config.id2label
+    label = id2label[pred_idx] if id2label and pred_idx in id2label else str(pred_idx)
+    confidence = float(probs[pred_idx].item())
+
+    # Build overlay
+    overlay_img = overlay_heatmap_on_image(pil_img, saliency, alpha=0.4)
+    heatmap_b64 = pil_to_b64(overlay_img)
+
+    return label, confidence, heatmap_b64
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
-        file = request.files["file"]
-        if file:
-            img_path = os.path.join(UPLOAD_FOLDER, file.filename)
-            file.save(img_path)
+        file = request.files.get("file")
+        if not file or file.filename == "":
+            abort(400, "No file uploaded.")
+        if not allowed_file(file.filename):
+            abort(400, "Only PNG files are accepted.")
 
-            # Use the classification model for pneumonia prediction
-            pneumonia_label, pneumonia_conf = predict_classification_hf(img_path)
-            
-            # Use the segmentation model for view prediction and heatmap generation
-            predicted_view, segmentation_mask = predict_segmentation_hf(img_path)
-            
-            # Generate heatmap from the segmentation mask
-            heatmap_b64 = generate_heatmap_from_mask(img_path, segmentation_mask)
+        save_path = os.path.join(UPLOAD_FOLDER, os.path.basename(file.filename))
+        file.save(save_path)
 
-            # Combine labels for display
-            label = f"Pneumonia: {pneumonia_label} (View: {predicted_view})"
-            confidence = pneumonia_conf * 100 # Convert to percentage
+        label, conf, heatmap_b64 = predict_and_saliency(save_path)
 
-            return render_template("result.html",
-                                   label=label,
-                                   confidence=round(confidence, 2),
-                                   heatmap=heatmap_b64)
+        return render_template(
+            "result.html",
+            label=f"Prediction: {label}",
+            confidence=f"{conf * 100:.2f}",
+            heatmap=heatmap_b64
+        )
+
     return render_template("index.html")
 
 if __name__ == "__main__":
+    # Flask dev server
     app.run(host="0.0.0.0", port=5001, debug=True)

@@ -1,21 +1,31 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-  <title>Prediction Result</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta charset="utf-8" />
+  <title>Result</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:2rem;color:#111}
+    .card{max-width:720px;margin:auto;padding:1.5rem;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 6px 20px rgba(0,0,0,.06)}
+    .pill{display:inline-block;padding:.35rem .6rem;border-radius:999px;background:#f3f4f6;border:1px solid #e5e7eb}
+    img{max-width:100%;border-radius:12px;border:1px solid #e5e7eb}
+    a.btn{display:inline-block;margin-top:1rem;padding:.6rem .9rem;border-radius:12px;background:#111;color:#fff;text-decoration:none}
+    .hint{color:#6b7280;font-size:.9rem}
+  </style>
 </head>
 <body>
-  <div class="result-container">
-    <h2>Prediction: {{ label }} ({{ confidence }} %)</h2>
-
+  <div class="card">
+    <h1>Prediction</h1>
+    <p><span class="pill">{{ label }}</span></p>
+    <p><strong>Confidence:</strong> {{ confidence }}%</p>
     {% if heatmap %}
-      <h3>Segmented Areas (AI Overlay):</h3>
-      <img src="data:image/png;base64,{{ heatmap }}" alt="Segmented Image">
+      <h2>Overlay</h2>
+      <img src="data:image/png;base64,{{ heatmap }}" alt="heatmap overlay" />
     {% else %}
-      <p>No segmentation heatmap generated.</p>
+      <p class="hint">No heatmap available.</p>
     {% endif %}
-
-    <a href="/">Upload another scan</a>
+    <a class="btn" href="/">⬅ Upload another PNG</a>
+    <p class="hint" style="margin-top:1rem">Research/demo only — not medical advice.</p>
   </div>
 </body>
 </html>
